@@ -208,7 +208,17 @@ struct DsInputReport {
     uint8_t touchpad_timestamp = 0;         // byte 41
     uint8_t l2_trigger_feedback[3] = {};    // bytes 42-44
     uint8_t r2_trigger_feedback[3] = {};    // bytes 45-47
-    uint8_t data_48_52[5] = {};             // bytes 48-52
+    // bytes 48-52: unknown/reserved on real hardware, except byte 49 (index
+    // 1), which at least one real-world consumer (daidr/dualsense-tester,
+    // used by ds.daidr.me) reads as a "normal vs. profile-configuration
+    // mode" status byte over Bluetooth: `byte && (byte & 0b11) === 0`. A
+    // literal 0 there fails that check in JS (0 is falsy, so `byte &&`
+    // short-circuits) and reads as "possibly in config mode" even though
+    // the low 2 bits — the actual mode indicator — are clear; a real Edge
+    // apparently never reports a literal 0 here. 0x04 is nonzero with the
+    // low 2 bits clear, satisfying the check as "normal mode" without
+    // claiming to know what (if anything) the other bits represent.
+    uint8_t data_48_52[5] = { 0x00, 0x04, 0x00, 0x00, 0x00 };  // bytes 48-52
     uint8_t status = 0x0A;                  // byte 53: low nibble=capacity 0-10, high=charging
     uint8_t status2 = 0x00;                 // byte 54: peripheral/connection status
     uint8_t data_55_71[17] = {};            // bytes 55-71

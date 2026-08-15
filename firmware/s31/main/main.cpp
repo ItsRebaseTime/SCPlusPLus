@@ -35,9 +35,17 @@ extern "C" void app_main(void) {
     le_audio_bap_begin();
     ESP_LOGI(TAG, "DualSense Edge BLE HID + LE Audio ready");
 
+    static uint32_t s_last_btns = 0;
+    static uint32_t s_poll_count = 0;
     for (;;) {
         SCReport report;
         if (sc_report_poll(&report)) {
+            s_poll_count++;
+            uint32_t btns = sc_buttons(report);
+            if (btns != s_last_btns) {
+                ESP_LOGI(TAG, "SC buttons changed: 0x%08lx (poll_count=%lu)", (unsigned long)btns, (unsigned long)s_poll_count);
+                s_last_btns = btns;
+            }
             ds_send(report);
         } else {
             ds_send_idle();

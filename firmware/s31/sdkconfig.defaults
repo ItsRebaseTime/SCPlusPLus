@@ -117,3 +117,34 @@ CONFIG_BT_NIMBLE_MAX_CCCDS=24
 # errors in NimBLE's own ble_hs_iso.c. Confirmed to exist and be selectable
 # (not another missing-implementation gap) by reading the Kconfig directly.
 CONFIG_BT_LE_ISO_SUPPORT=y
+
+# NimBLE's default INFO log level logs every GATT procedure at the host
+# stack level ("GATT procedure initiated: notify; att_handle=...") which,
+# for a HID device notifying at controller polling rate, floods the
+# console. Dropping to WARNING keeps connection/error-level NimBLE logs
+# without the per-packet noise.
+CONFIG_BT_NIMBLE_LOG_LEVEL_WARNING=y
+CONFIG_BT_NIMBLE_LOG_LEVEL=2
+
+# Real hardware bring-up (2026-08-15): bonding is now enabled (see
+# le_audio_bap.c's sm_bonding=1 change) — without NVS persistence, bond keys
+# only live in RAM and are lost on every reboot, forcing the host to re-pair
+# each time instead of reconnecting to an already-trusted device.
+CONFIG_BT_NIMBLE_NVS_PERSIST=y
+
+# Real hardware bring-up (2026-08-15): NimBLE's ble_svc_dis component gates
+# each individual Device Information characteristic behind its own Kconfig
+# option — PNP_ID defaults off, so ble_svc_dis_pnp_id_set() in
+# le_audio_bap.c was silently a no-op: no PnP ID (0x2A50) characteristic
+# ever got registered at all (confirmed via a real GATT discovery — DIS
+# only exposed Model Number + IEEE regulatory data). BlueZ's hog_accept()
+# reads the peer's vendor/product ID from exactly this characteristic to
+# populate the kernel HID device's identity — without it, this device
+# showed up as VID=0000/PID=0000 instead of Sony's real 054C:0DF2. That's
+# not just cosmetic: distro udev rules (e.g. Steam's own
+# 60-steam-input.rules, matching KERNELS=="*054C:0DF2*") grant proper
+# uaccess permissions on the hidraw device specifically by VID:PID — with
+# the wrong identity, hidraw stayed root-only, which is why WebHID
+# (navigator.hid, used by sites like ds.daidr.me) showed an empty device
+# picker despite the gamepad otherwise working end-to-end.
+CONFIG_BT_NIMBLE_SVC_DIS_PNP_ID=y

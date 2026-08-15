@@ -180,6 +180,71 @@ device then sits stable in its steady-state loop with no further log output,
 exactly as expected (nothing in the 4ms poll loop or the BLE stack's normal
 operation logs at INFO level).
 
+## Using PlatformIO (2026-08-15) — serial monitor yes, `pio run` not recommended
+
+`platformio.ini` in this directory still targets pioarduino's
+`platform-espressif32`/`framework-espidf` (the stale fork — see "Current
+recipe" above), kept mainly so `pio device monitor` has a project to attach
+to. Investigated turning it into a full alternative build path; here's
+exactly where that stands:
+
+**`pio device monitor -p /dev/ttyACM0` works today, independent of
+everything below.** It only needs the serial port, not a successful
+`pio run` — confirmed directly (it got all the way to opening the terminal
+UI in testing; only failed here because the test environment had no real
+TTY on stdin, an environment limitation, not a project one). Use this for
+PlatformIO's serial terminal conveniences; `monitor_speed` is already set
+correctly in `platformio.ini`.
+
+**`pio run -e s31coreboard` is not recommended, even after real fixes.**
+Three genuine bugs in pioarduino's `platform-espressif32` 55.3.311 were
+found and patched *locally* (in the installed package under
+`~/.platformio/platforms/espressif32/builder/frameworks/espidf.py` — not
+committed anywhere, since it's outside this repo):
+
+1. `platform.get_package_dir("toolchain-riscv32-esp")` returns `None` even
+   directly after the Tool Manager reports the package "has been installed" —
+   confirmed by direct inspection: the package never actually lands in
+   `~/.platformio/packages/` or anywhere else findable, regardless of
+   whether it's fetched from the pinned GitHub release URL or a local
+   `file://` override. This causes the long-known `Error: Missing toolchain
+   directory 'None'` failure. Worked around with an explicit fallback to the
+   known-good toolchain already extracted for the `idf.py` recipe above.
+2. The same underlying disconnect means PlatformIO Core's own generic
+   package-PATH construction never adds this toolchain's `bin/` to SCons's
+   actual compile-invocation `PATH` either (`riscv32-esp-elf-g++: command
+   not found`, even with fix #1 applied) — worked around with an explicit
+   `env.PrependENVPath("PATH", ...)`.
+3. (Time-wasting side-note, not a bug: there were *two* different cached
+   copies of the pioarduino platform package on this machine, an old one at
+   `espressif32@src-<hash>` pinned to a completely different release
+   (`55.03.37`) and the actual active one at plain `espressif32/` pinned to
+   `55.03.311` per `platformio.ini`. Only patching the *active* one has any
+   effect — check `.piopm`'s `uri` field to tell them apart if this comes up
+   again.)
+
+With those three fixes, `pio run` gets much further than before — it
+compiles the *entire* main application and most of the bootloader — but then
+fails in `bootloader.sections.ld.in` preprocessing (`fatal error:
+bootloader.sections.common.ld: No such file or directory`, a missing
+`-I` search path), not yet fixed.
+
+**More importantly: even a fully green `pio run` would currently produce a
+binary built against the wrong ESP-IDF.** `platform_packages`'
+`framework-espidf` entry still points at `pioarduino/esp-idf#master`, which
+resolved here to commit `69b3f7ee` — the exact same ~4-month-stale fork that
+caused the original silent boot hang documented above. Getting `pio run` to
+produce something worth flashing would also mean repointing that entry at
+official `espressif/esp-idf`, itself a comparable amount of work to what
+already got this project running on real hardware (Python/component-manager
+version bumps, `-Wmissing-field-initializers` flags, the whole "Real
+hardware bring-up" list above) — not yet attempted through the PlatformIO
+path specifically.
+
+**Bottom line:** use `pio device monitor` for the serial terminal; keep
+building/flashing via the `idf.py` + official-IDF recipe above, which is the
+one actually verified working end-to-end on real hardware.
+
 ## Superseded: manual IDF patches from before the official-master switch
 
 These are no longer needed — official `espressif/esp-idf` master already has

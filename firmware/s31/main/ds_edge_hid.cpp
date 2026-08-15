@@ -61,6 +61,7 @@ static const ble_uuid16_t UUID_REPORT_REF    = BLE_UUID16_INIT(0x2908);
 static uint16_t s_conn_handle  = BLE_HS_CONN_HANDLE_NONE;
 static bool     s_connected    = false;
 static uint16_t s_input_handle = 0;  // for ble_gatts_notify_custom()
+static bool     s_input_notify_enabled = false;
 
 static DsInputReport      s_input;
 static DsPairingInfoReport s_pairing;
@@ -487,12 +488,36 @@ void ds_edge_hid_on_disconnect() {
     ESP_LOGI(TAG, "disconnected");
     s_connected = false;
     s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
+    s_input_notify_enabled = false;
+}
+
+// Real hardware bring-up (2026-08-15): notify_input() used to fire
+// unconditionally on every ds_send()/ds_send_idle() call — the main loop's
+// 4ms poll cadence (see main.cpp) turned that into a continuous ~250Hz
+// ble_gatts_notify_custom() flood from the instant of connection, whether
+// or not the central had ever enabled notifications on this characteristic.
+// That's not just needless radio/CPU load (and the "GATT procedure
+// initiated: notify" log spam this project first noticed) — it very likely
+// starved the SMP pairing handshake that has to happen over the same ATT
+// bearer right after connecting: with sm_bonding now enabled (see
+// le_audio_bap.c), pairing was reliably failing with a raw encryption
+// change status of 6 while this flood was running unthrottled. Gating on
+// the peer's actual CCCD subscription state (via BLE_GAP_EVENT_SUBSCRIBE)
+// is both the spec-correct behavior and stops the flood before pairing
+// ever needs to compete with it.
+void ds_edge_hid_on_subscribe(uint16_t attr_handle, bool notify_enabled) {
+    ESP_LOGI(TAG, "subscribe event: attr_handle=%d notify_enabled=%d (s_input_handle=%d)",
+             attr_handle, notify_enabled, s_input_handle);
+    if (attr_handle == s_input_handle) {
+        s_input_notify_enabled = notify_enabled;
+        ESP_LOGI(TAG, "input report notify %s", notify_enabled ? "ENABLED" : "disabled");
+    }
 }
 
 bool ds_connected() { return s_connected; }
 
 static void notify_input() {
-    if (!s_connected || s_input_handle == 0) return;
+    if (!s_connected || s_input_handle == 0 || !s_input_notify_enabled) return;
     uint8_t bthdr[] = { PS_INPUT_CRC32_SEED, DUALSENSE_EDGE_INPUT_REPORT_ID };
     uint32_t crc = ds_crc32_le(0xFFFFFFFF, bthdr, sizeof(bthdr));
     crc = ~ds_crc32_le(crc, (uint8_t*)&s_input, sizeof(s_input) - 4);

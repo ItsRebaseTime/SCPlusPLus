@@ -32,6 +32,7 @@ const struct ble_gatt_svc_def* ds_edge_hid_get_services();
 // Called by le_audio_bap.c's shared GAP event handler.
 void ds_edge_hid_on_connect(uint16_t conn_handle);
 void ds_edge_hid_on_disconnect();
+void ds_edge_hid_on_subscribe(uint16_t attr_handle, bool notify_enabled);
 
 bool ds_connected();
 void ds_send(const SCReport& sc);

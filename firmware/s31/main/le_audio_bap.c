@@ -26,11 +26,13 @@
 #include "le_audio_bap.h"
 
 #include "esp_bt.h"
+#include "nimble/ble.h"
 #include "nimble/nimble_port.h"
 #include "nimble/nimble_port_freertos.h"
 #include "host/ble_hs.h"
 #include "host/ble_gap.h"
 #include "host/ble_gatt.h"
+#include "host/ble_store.h"
 #include "host/util/util.h"
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
@@ -52,6 +54,8 @@
 
 #include "esp_log.h"
 #include "esp_err.h"
+#include "esp_system.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 
 #include <stdbool.h>
@@ -66,6 +70,7 @@ struct ble_gatt_svc_def;
 extern const struct ble_gatt_svc_def* ds_edge_hid_get_services(void);
 extern void ds_edge_hid_on_connect(uint16_t conn_handle);
 extern void ds_edge_hid_on_disconnect(void);
+extern void ds_edge_hid_on_subscribe(uint16_t attr_handle, bool notify_enabled);
 
 // From le_audio_codec.cpp. Declared locally rather than via #include
 // "le_audio_codec.h" because that header declares codec_init() with a C++
@@ -75,6 +80,24 @@ extern size_t codec_write(const int16_t *samples, size_t byte_len);
 extern size_t codec_read(int16_t *samples, size_t byte_len);
 
 static const char *TAG = "le_audio_bap";
+
+// Real hardware bring-up (2026-08-15): PACS/ASCS registration temporarily
+// disabled. LE Audio can't stream on this dev machine's kernel yet
+// regardless (bluetoothd: "BAP requires ISO Socket which is not enabled" —
+// a Linux kernel capability, not something this firmware or BlueZ config
+// controls), while ASCS's ASE state notifications were confirmed (via a raw
+// ATT probe, bypassing BlueZ) to sometimes interleave with BlueZ's
+// multi-part Report Map read right after connecting, an interleaving
+// BlueZ's own reader isn't robust to — this intermittently truncated what
+// the kernel's HID parser received, breaking gamepad recognition on an
+// unpredictable, timing-dependent basis. Since the audio side is already
+// non-functional here for an unrelated reason, disabling it removes that
+// interference and makes gamepad recognition reliable instead of racy.
+// A `static const bool` (not #if) so the callback structs/functions below
+// stay referenced and compiled either way — flipping this back to true is
+// the only change needed to re-enable LE Audio once ISO socket support is
+// confirmed available.
+static const bool LE_AUDIO_ASCS_ENABLED = false;
 
 static uint8_t s_own_addr_type = 0;
 
@@ -357,14 +380,15 @@ static void start_advertising(void) {
     struct ble_hs_adv_fields fields = {0};
     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
 
-    // Advertise both the HID-over-GATT service UUID and PACS, so host OS
-    // Bluetooth stacks can recognize this as a combo HID+LE-Audio device.
+    // Advertise the HID-over-GATT service UUID. PACS is left out of both
+    // the advertisement and (see LE_AUDIO_ASCS_ENABLED) actual registration
+    // for now — advertising a service this device isn't currently serving
+    // would be actively misleading, not just incomplete.
     static const ble_uuid16_t adv_uuids[] = {
         BLE_UUID16_INIT(0x1812),  // HID
-        BLE_UUID16_INIT(BT_UUID_PACS_VAL),
     };
     fields.uuids16 = (ble_uuid16_t*)adv_uuids;
-    fields.num_uuids16 = 2;
+    fields.num_uuids16 = 1;
     fields.uuids16_is_complete = 1;
 
     int rc = ble_gap_adv_set_fields(&fields);
@@ -376,13 +400,17 @@ static void start_advertising(void) {
     struct ble_hs_adv_fields rsp_fields = {0};
     rsp_fields.tx_pwr_lvl_is_present = 1;
     rsp_fields.tx_pwr_lvl = BLE_HS_ADV_TX_PWR_LVL_AUTO;
-    // Wearable Audio Device / Headset appearance — closer to the combo
-    // device's actual behavior than a plain HID gamepad value, since this
-    // one advertisement now represents both roles. Worth validating against
-    // a real host: whether one appearance value serves both profiles
-    // acceptably, or whether the two need to be distinguished some other
-    // way, is unverified.
-    rsp_fields.appearance = ESP_BLE_AUDIO_APPEARANCE_WEARABLE_AUDIO_DEVICE_HEADSET;
+    // Real hardware bring-up (2026-08-15): the Wearable Audio Device/Headset
+    // appearance this used to advertise (on the theory that it's "closer to
+    // the combo device's actual behavior") tested badly against a real host
+    // — bonded via BlueZ (Paired/Bonded/Trusted all yes), but no uhid input
+    // device was ever created, even after a fresh reconnect while already
+    // bonded+trusted. Switched to the HID/Gamepad category (0x03C4, Bluetooth
+    // SIG assigned numbers) since that's what a HOGP-consuming host's input
+    // plugin is actually looking for; this device's audio role is still
+    // fully discoverable via the advertised PACS service UUID regardless of
+    // the appearance category chosen for the icon/HID-recognition role.
+    rsp_fields.appearance = 0x03C4;
     rsp_fields.appearance_is_present = 1;
 
     static const char name[] = "DualSense Edge";
@@ -401,6 +429,37 @@ static void start_advertising(void) {
     advp.disc_mode = BLE_GAP_DISC_MODE_GEN;
     rc = ble_gap_adv_start(s_own_addr_type, NULL, BLE_HS_FOREVER, &advp, gap_event_handler, NULL);
     if (rc != 0) ESP_LOGE(TAG, "adv_start failed rc=%d", rc);
+    else ESP_LOGI(TAG, "advertising started");
+}
+
+// Real hardware bring-up (2026-08-15): sm_bonding=1 alone only makes
+// bonding *possible* — nothing actually triggers it, since none of the
+// HID/PACS characteristics require encryption (so the central never sees
+// an "insufficient authentication" ATT error to react to) and NimBLE
+// peripherals don't initiate security on their own. Real BLE HID
+// peripherals proactively send a Security Request right after connecting;
+// do the same here so BlueZ's HOGP/BAP host-side plugins — which both
+// require a bonded link before they'll create a uhid device or wire up
+// audio — actually get one.
+//
+// Calling ble_gap_security_initiate() synchronously from inside the
+// BLE_GAP_EVENT_CONNECT callback itself reliably failed with
+// BLE_HS_EALREADY ("security procedure already in progress") on real
+// hardware, even against a from-scratch central with no prior bond at
+// all — confirmed by erasing the NVS bond store and retrying. The NimBLE
+// reference examples (bleprph) never call this from inside the connect
+// callback either. Deferring it to a short-lived task a moment after the
+// callback returns avoids whatever internal state the host is still
+// settling at that exact point.
+static void security_initiate_task(void *arg) {
+    uint16_t conn_handle = (uint16_t)(uintptr_t)arg;
+    vTaskDelay(pdMS_TO_TICKS(200));
+    ESP_LOGI(TAG, "free heap before security_initiate: %lu", (unsigned long)esp_get_free_heap_size());
+    int sec_rc = ble_gap_security_initiate(conn_handle);
+    if (sec_rc != 0) {
+        ESP_LOGW(TAG, "security_initiate failed rc=%d", sec_rc);
+    }
+    vTaskDelete(NULL);
 }
 
 static int gap_event_handler(struct ble_gap_event *event, void *arg) {
@@ -408,18 +467,81 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
     case BLE_GAP_EVENT_CONNECT:
         if (event->connect.status == 0) {
             ds_edge_hid_on_connect(event->connect.conn_handle);
+            xTaskCreate(security_initiate_task, "sec_init", 3072,
+                        (void*)(uintptr_t)event->connect.conn_handle, tskIDLE_PRIORITY + 1, NULL);
         } else {
             ESP_LOGW(TAG, "BLE connect failed, status=%d", event->connect.status);
             start_advertising();
         }
         return 0;
     case BLE_GAP_EVENT_DISCONNECT:
+        ESP_LOGI(TAG, "disconnect reason=%d (0x%x)", event->disconnect.reason, event->disconnect.reason);
+        // Real hardware bring-up (2026-08-15): reproduced by hand, repeatedly
+        // — if the central "forgets" this device (re-pairing, or its own
+        // bond store getting cleared) without this peripheral's NVS-
+        // persisted bond also being cleared, the *link layer itself* tries
+        // to resume encryption with the now one-sided stored LTK and the
+        // controller tears the connection down immediately (~130ms, before
+        // any GATT/SMP traffic) with HCI error 0x05 (BLE_ERR_AUTH_FAIL,
+        // wrapped by NimBLE as BLE_HS_HCI_ERR(BLE_ERR_AUTH_FAIL) = 0x205).
+        // This happens entirely below the SM host layer — neither
+        // BLE_GAP_EVENT_ENC_CHANGE nor BLE_GAP_EVENT_REPEAT_PAIRING ever
+        // fire for it (confirmed: both are otherwise-correct handlers for
+        // the *host*-level version of this same problem, added earlier, but
+        // neither one is reachable from this specific failure path) — so
+        // without this check, every future pairing attempt repeats the
+        // identical failure forever, until someone manually erases this
+        // device's NVS partition. Deleting our half of the stale bond here
+        // lets the very next attempt (start_advertising() below already
+        // restarts advertising for it) start clean instead.
+        if (event->disconnect.reason == BLE_HS_HCI_ERR(BLE_ERR_AUTH_FAIL)) {
+            ble_store_util_delete_peer(&event->disconnect.conn.peer_id_addr);
+        }
         ds_edge_hid_on_disconnect();
         start_advertising();
         return 0;
     case BLE_GAP_EVENT_MTU:
         ESP_LOGI(TAG, "MTU update: %d", event->mtu.value);
         return 0;
+    case BLE_GAP_EVENT_SUBSCRIBE:
+        ds_edge_hid_on_subscribe(event->subscribe.attr_handle, event->subscribe.cur_notify);
+        return 0;
+    case BLE_GAP_EVENT_ENC_CHANGE:
+        ESP_LOGI(TAG, "encryption change: conn=%d status=%d free_heap=%lu",
+                 event->enc_change.conn_handle, event->enc_change.status,
+                 (unsigned long)esp_get_free_heap_size());
+        // Real hardware bring-up (2026-08-15): reproduced by hand — if the
+        // central "forgets"/removes this device on its side (e.g. the user
+        // re-pairs, or the host's own bond store gets cleared) without this
+        // peripheral's NVS-persisted bond also being cleared, NimBLE
+        // recognizes the reconnecting peer and tries to resume encryption
+        // with the now-one-sided stored LTK. The central rejects it and the
+        // link drops almost immediately (~130ms, before any GATT traffic),
+        // which without this fix repeats identically forever — every future
+        // pairing attempt fails silently until someone manually erases this
+        // device's NVS partition. Deleting our half of the stale bond on
+        // failure lets the very next attempt start clean instead.
+        if (event->enc_change.status != 0) {
+            struct ble_gap_conn_desc desc;
+            if (ble_gap_conn_find(event->enc_change.conn_handle, &desc) == 0) {
+                ble_store_util_delete_peer(&desc.peer_id_addr);
+            }
+        }
+        return 0;
+    case BLE_GAP_EVENT_REPEAT_PAIRING: {
+        // We already hold a bond for this peer, but it's attempting a fresh
+        // pairing (e.g. the peer forgot/removed its side). Sacrifice the old
+        // bond for convenience rather than reject the new pairing outright.
+        ESP_LOGI(TAG, "repeat pairing: conn=%d", event->repeat_pairing.conn_handle);
+        struct ble_gap_conn_desc desc;
+        int rc = ble_gap_conn_find(event->repeat_pairing.conn_handle, &desc);
+        if (rc == 0) {
+            int64_t t0 = esp_timer_get_time();
+            ble_store_util_delete_peer(&desc.peer_id_addr);
+            ESP_LOGI(TAG, "repeat pairing: delete_peer took %lld us", esp_timer_get_time() - t0);
+        }
+        return BLE_GAP_REPEAT_PAIRING_RETRY;
+    }
     default:
         return 0;
     }
@@ -445,47 +567,60 @@ static void register_services_and_start(void) {
     if (s_services_registered) return;
     s_services_registered = true;
 
+    ble_svc_gap_init();
+    ble_svc_gatt_init();
+
     ESP_ERROR_CHECK(esp_ble_audio_common_init(NULL));
 
     ble_svc_dis_init();
     ble_svc_dis_manufacturer_name_set("Sony Interactive Entertainment");
     ble_svc_dis_model_number_set("DualSense Edge Wireless Controller");
-    {
-        uint8_t pnp[7] = {
-            0x02, 0x4C, 0x05, 0xF2, 0x0D, 0x08, 0x04,  // Sony VID 0x054C, DS Edge PID 0x0DF2, ver 0x0408
-        };
-        ble_svc_dis_pnp_id_set((const char*)pnp);
-    }
+    // Real hardware bring-up (2026-08-15): ble_svc_dis_pnp_id_set() only
+    // stores the POINTER it's given (ble_svc_dis.c: `ble_svc_dis_data.pnp_id
+    // = value;`), not a copy — it re-reads through that pointer later,
+    // whenever a real central actually requests the PnP ID characteristic.
+    // The array here used to be a local declared in a scope block that
+    // closed on the very next line, so by the time any client read it, this
+    // was a dangling pointer into long-since-reused stack memory — BlueZ
+    // read back garbage (VID=0x0309/PID=0x7E2F, not Sony's real
+    // 0x054C:0x0DF2) instead of a crash, since nothing else caught the
+    // invalid access. `static` gives it program-lifetime storage instead.
+    static const uint8_t s_pnp_id[7] = {
+        0x02, 0x4C, 0x05, 0xF2, 0x0D, 0x08, 0x04,  // Sony VID 0x054C, DS Edge PID 0x0DF2, ver 0x0408
+    };
+    ble_svc_dis_pnp_id_set((const char*)s_pnp_id);
     ble_svc_bas_init();
 
-    // PACS: bidirectional (sink = speaker, source = mic).
-    esp_ble_audio_pacs_register_param_t pacs_param = {0};
-    pacs_param.snk_pac = true;
-    pacs_param.snk_loc = true;
-    pacs_param.src_pac = true;
-    pacs_param.src_loc = true;
-    ESP_ERROR_CHECK(esp_ble_audio_pacs_register(&pacs_param));
-    ESP_ERROR_CHECK(esp_ble_audio_pacs_cap_register(ESP_BLE_AUDIO_DIR_SINK, &s_pacs_cap_snk));
-    ESP_ERROR_CHECK(esp_ble_audio_pacs_cap_register(ESP_BLE_AUDIO_DIR_SOURCE, &s_pacs_cap_src));
-    ESP_ERROR_CHECK(esp_ble_audio_pacs_set_location(ESP_BLE_AUDIO_DIR_SINK, ESP_BLE_AUDIO_LOCATION_MONO_AUDIO));
-    ESP_ERROR_CHECK(esp_ble_audio_pacs_set_location(ESP_BLE_AUDIO_DIR_SOURCE, ESP_BLE_AUDIO_LOCATION_MONO_AUDIO));
-    // Real hardware bring-up (2026-08-15): "available" contexts must be a
-    // subset of "supported" contexts — the blob's PACS validation rejected
-    // set_available_contexts() with "PacsInvSuppMask" because supported
-    // contexts defaults to empty and was never explicitly set.
-    ESP_ERROR_CHECK(esp_ble_audio_pacs_set_supported_contexts(ESP_BLE_AUDIO_DIR_SINK, ESP_BLE_AUDIO_CONTEXT_TYPE_CONVERSATIONAL));
-    ESP_ERROR_CHECK(esp_ble_audio_pacs_set_supported_contexts(ESP_BLE_AUDIO_DIR_SOURCE, ESP_BLE_AUDIO_CONTEXT_TYPE_CONVERSATIONAL));
-    ESP_ERROR_CHECK(esp_ble_audio_pacs_set_available_contexts(ESP_BLE_AUDIO_DIR_SINK, ESP_BLE_AUDIO_CONTEXT_TYPE_CONVERSATIONAL));
-    ESP_ERROR_CHECK(esp_ble_audio_pacs_set_available_contexts(ESP_BLE_AUDIO_DIR_SOURCE, ESP_BLE_AUDIO_CONTEXT_TYPE_CONVERSATIONAL));
+    if (LE_AUDIO_ASCS_ENABLED) {
+        // PACS: bidirectional (sink = speaker, source = mic).
+        esp_ble_audio_pacs_register_param_t pacs_param = {0};
+        pacs_param.snk_pac = true;
+        pacs_param.snk_loc = true;
+        pacs_param.src_pac = true;
+        pacs_param.src_loc = true;
+        ESP_ERROR_CHECK(esp_ble_audio_pacs_register(&pacs_param));
+        ESP_ERROR_CHECK(esp_ble_audio_pacs_cap_register(ESP_BLE_AUDIO_DIR_SINK, &s_pacs_cap_snk));
+        ESP_ERROR_CHECK(esp_ble_audio_pacs_cap_register(ESP_BLE_AUDIO_DIR_SOURCE, &s_pacs_cap_src));
+        ESP_ERROR_CHECK(esp_ble_audio_pacs_set_location(ESP_BLE_AUDIO_DIR_SINK, ESP_BLE_AUDIO_LOCATION_MONO_AUDIO));
+        ESP_ERROR_CHECK(esp_ble_audio_pacs_set_location(ESP_BLE_AUDIO_DIR_SOURCE, ESP_BLE_AUDIO_LOCATION_MONO_AUDIO));
+        // Real hardware bring-up (2026-08-15): "available" contexts must be a
+        // subset of "supported" contexts — the blob's PACS validation rejected
+        // set_available_contexts() with "PacsInvSuppMask" because supported
+        // contexts defaults to empty and was never explicitly set.
+        ESP_ERROR_CHECK(esp_ble_audio_pacs_set_supported_contexts(ESP_BLE_AUDIO_DIR_SINK, ESP_BLE_AUDIO_CONTEXT_TYPE_CONVERSATIONAL));
+        ESP_ERROR_CHECK(esp_ble_audio_pacs_set_supported_contexts(ESP_BLE_AUDIO_DIR_SOURCE, ESP_BLE_AUDIO_CONTEXT_TYPE_CONVERSATIONAL));
+        ESP_ERROR_CHECK(esp_ble_audio_pacs_set_available_contexts(ESP_BLE_AUDIO_DIR_SINK, ESP_BLE_AUDIO_CONTEXT_TYPE_CONVERSATIONAL));
+        ESP_ERROR_CHECK(esp_ble_audio_pacs_set_available_contexts(ESP_BLE_AUDIO_DIR_SOURCE, ESP_BLE_AUDIO_CONTEXT_TYPE_CONVERSATIONAL));
 
-    // ASCS: 1 sink ASE + 1 source ASE.
-    esp_ble_audio_bap_unicast_server_register_param_t ascs_param = {0};
-    ascs_param.snk_cnt = 1;
-    ascs_param.src_cnt = 1;
-    ESP_ERROR_CHECK(esp_ble_audio_bap_unicast_server_register(&ascs_param));
-    ESP_ERROR_CHECK(esp_ble_audio_bap_unicast_server_register_cb(&s_server_cb));
-    ESP_ERROR_CHECK(esp_ble_audio_bap_stream_cb_register(&s_sink_stream, &s_stream_ops));
-    ESP_ERROR_CHECK(esp_ble_audio_bap_stream_cb_register(&s_source_stream, &s_stream_ops));
+        // ASCS: 1 sink ASE + 1 source ASE.
+        esp_ble_audio_bap_unicast_server_register_param_t ascs_param = {0};
+        ascs_param.snk_cnt = 1;
+        ascs_param.src_cnt = 1;
+        ESP_ERROR_CHECK(esp_ble_audio_bap_unicast_server_register(&ascs_param));
+        ESP_ERROR_CHECK(esp_ble_audio_bap_unicast_server_register_cb(&s_server_cb));
+        ESP_ERROR_CHECK(esp_ble_audio_bap_stream_cb_register(&s_sink_stream, &s_stream_ops));
+        ESP_ERROR_CHECK(esp_ble_audio_bap_stream_cb_register(&s_source_stream, &s_stream_ops));
+    }
 
     // HID service (ds_edge_hid.cpp) onto the same GATT server.
     const struct ble_gatt_svc_def *hid_svcs = ds_edge_hid_get_services();
@@ -496,10 +631,35 @@ static void register_services_and_start(void) {
 
     ble_svc_gap_device_name_set("DualSense Edge");
 
-    rc = ble_gatts_start();
-    if (rc != 0) { ESP_LOGE(TAG, "gatts_start failed rc=%d", rc); return; }
+    // Real hardware bring-up (2026-08-15): esp_ble_audio has a two-phase
+    // init/start API — esp_ble_audio_common_init() (called earlier, in
+    // le_audio_bap_begin()) only initializes the GAP/GATT app-event
+    // plumbing; esp_ble_audio_common_start() is the actual "start BLE Audio
+    // services" call, and its NimBLE adapter (host/adapter/nimble/init.c's
+    // bt_le_nimble_audio_start(), confirmed by reading the adapter source
+    // directly — esp_ble_audio itself is a closed-source .a blob, but this
+    // adapter layer around it is not) is what actually calls NimBLE's
+    // ble_gatts_start() internally. This code was calling our own
+    // ble_gatts_start() directly instead and never calling
+    // esp_ble_audio_common_start() at all — which happened to still report
+    // rc=0 and still populate ble_gatts_show_local()'s view correctly, but
+    // a real GATT client's "Discover All Primary Services" (ATT Read By
+    // Group Type, UUID 0x2800) against the device returned ATT error 0x0A
+    // (Attribute Not Found) across the *entire* handle range regardless —
+    // confirmed with a raw ATT probe bypassing BlueZ/NimBLE's higher-level
+    // caching entirely. This is *the* root cause of gamepad-tester sites
+    // never recognizing the device and LE Audio never showing up as a
+    // Linux audio device: nothing could ever discover our services at all.
+    // Calling the documented esp_ble_audio_common_start() entry point
+    // instead — after all our own ble_gatts_add_svcs() calls, matching its
+    // own internal comment ("Register GMAS before ble_gatts_start") — lets
+    // it drive ble_gatts_start() itself in the sequence/context it
+    // actually expects.
+    ESP_ERROR_CHECK(esp_ble_audio_common_start(NULL));
 
-    xTaskCreate(mic_encode_task, "mic_enc", 4096, NULL, 5, &s_mic_task_handle);
+    if (LE_AUDIO_ASCS_ENABLED) {
+        xTaskCreate(mic_encode_task, "mic_enc", 4096, NULL, 5, &s_mic_task_handle);
+    }
 }
 
 static void on_sync(void) {
@@ -604,20 +764,50 @@ void le_audio_bap_begin(void) {
 
     ble_hs_cfg.sync_cb = on_sync;
     ble_hs_cfg.reset_cb = on_reset;
-    ble_hs_cfg.sm_bonding = 0;
+    // Real hardware bring-up (2026-08-15): the previous sm_bonding=0 "simpler
+    // first pass" (see ds_edge_hid.cpp's now-resolved KNOWN GAP comment)
+    // turned out to be why nothing worked against a real host — BlueZ's HOGP
+    // input plugin and its LE Audio/BAP plugin both require a bonded link
+    // before they'll create a uhid device / wire up an audio device; an
+    // unbonded GATT connection (which is all sm_bonding=0 ever produced) was
+    // silently insufficient for either, despite the GAP connection itself
+    // succeeding. This device has no display/keyboard, so Just Works
+    // (sm_mitm=0) is the only pairing method available — LE Secure
+    // Connections (sm_sc=1) is used since CONFIG_BT_NIMBLE_SM_SC=y already
+    // compiles it in and it's the modern preferred method.
+    ble_hs_cfg.sm_bonding = 1;
     ble_hs_cfg.sm_mitm = 0;
-    ble_hs_cfg.sm_sc = 0;
-    ble_hs_cfg.sm_our_key_dist = 0;
-    ble_hs_cfg.sm_their_key_dist = 0;
+    ble_hs_cfg.sm_sc = 1;
+    ble_hs_cfg.sm_our_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+    ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
 
-    ble_svc_gap_init();
-    ble_svc_gatt_init();
-
-    // Real hardware bring-up (2026-08-15): esp_ble_audio_common_init() and
+    // Real hardware bring-up (2026-08-15): ble_svc_gap_init()/
+    // ble_svc_gatt_init() used to run right here, before the host task
+    // starts — and NimBLE's own host startup (ble_hs.c's ble_hs_start(),
+    // called automatically once the host syncs with the controller) calls
+    // ble_gatts_start() itself for whatever's registered by that point.
+    // That's standard NimBLE behavior, but esp_ble_audio_common_init() and
     // everything downstream of it (PACS/ASCS/HID registration,
-    // ble_gatts_start()) is deferred to register_services_and_start(),
-    // called from on_sync() — see that function's comment for why (needs
-    // the NimBLE host actually synced with the controller, which only
-    // happens once the host task below is running).
+    // esp_ble_audio_common_start() -> ble_gatts_start()) has to be deferred
+    // to register_services_and_start(), called from on_sync() — needs the
+    // host already synced, confirmed via a real BLE_HS_ENOTSYNCED error
+    // otherwise. In NimBLE's default "static" service mode, every
+    // ble_gatts_start() call unconditionally frees and rebuilds the *entire*
+    // live ATT attribute table from scratch (confirmed by instrumenting
+    // ble_att_svr_start()/ble_att_svr_register() directly and capturing
+    // real boot output — this is not documented anywhere obvious), so that
+    // automatic first call (registering just GAP+GATT) was being silently
+    // wiped out and orphaned by the second, real one moments later. This
+    // was the actual root cause of gamepad-tester sites and Linux's
+    // Bluetooth stack alike never being able to discover *any* of this
+    // device's services — confirmed with a raw ATT "Discover All Primary
+    // Services" probe returning ATT error 0x0A (Attribute Not Found) across
+    // the entire handle range, despite every individual registration call
+    // reporting success. Moving GAP/GATT registration into
+    // register_services_and_start() too means nothing is registered before
+    // the host's automatic first ble_gatts_start() call runs, so that call
+    // has nothing meaningful to lose — everything (GAP+GATT+DIS+BAS+PACS+
+    // ASCS+HID) ends up registered together in the one call that actually
+    // matters.
     nimble_port_freertos_init(nimble_host_task);
 }
