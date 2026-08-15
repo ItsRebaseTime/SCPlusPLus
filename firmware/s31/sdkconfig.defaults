@@ -1,0 +1,74 @@
+# ESP32-S31 Function-CoreBoard-1 — NimBLE host, peripheral role only.
+#
+# Unlike the S3 build (sdkconfig.defaults at repo root), this board's debug
+# UART/JTOG live on a dedicated USB-C port separate from the USB-A host port
+# the Steam Controller uses, so no console-routing workaround is needed here.
+CONFIG_USB_OTG_SUPPORTED=y
+
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=n
+
+# Observer role: this device never scans/connects as a GAP central, but the
+# CIS/BIG ISO HCI event handler bodies (ble_hs_hci_evt_le_cis_estab et al —
+# what "undefined reference" pointed at) are, in NimBLE's own upstream
+# host/src/ble_hs_hci_evt.c, textually nested inside
+# `#if MYNEWT_VAL(BLE_EXT_ADV) && NIMBLE_BLE_SCAN`, and
+# NIMBLE_BLE_SCAN expands to (BLE_ROLE_CENTRAL || BLE_ROLE_OBSERVER)
+# (nimble/nimble_opt_auto.h). Confirmed by direct preprocessor bisection,
+# not guessed — with Observer off, that whole block (including the CIS
+# handlers our BAP unicast server needs) was silently compiled out, leaving
+# only forward declarations, hence "used but never defined" at link time.
+# Observer is the minimal role satisfying this without adding actual GAP
+# Central (connection-initiating) capability this device doesn't need.
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=y
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+
+# Device Information + Battery service helpers (services/dis, services/bas) —
+# used for the DualSense Edge's manufacturer/PnP-ID and battery-level
+# characteristics. The HID-over-GATT service itself is hand-rolled against
+# the raw ble_gatt_svc_def API (see ds_edge_hid.cpp) since ble_svc_hid's
+# generic report array has no app-level write/notify hook, which a fast-
+# changing gamepad input stream needs.
+CONFIG_BT_NIMBLE_BAS_SERVICE=y
+CONFIG_BT_NIMBLE_DIS_SERVICE=y
+
+# Required by espressif/esp_bt_audio's bundled NimBLE integration
+# (bt_audio_host_nimble.c calls ble_gap_ext_adv_*/ble_gap_periodic_adv_*,
+# which only exist when this is enabled) — confirmed via a real build
+# attempt in Phase 0/3, not from documentation. Legacy ble_gap_adv_start()
+# (used by ds_edge_hid.cpp for the DualSense HID) keeps working once this
+# is on; verify that assumption doesn't break anything once both services
+# share one NimBLE host.
+CONFIG_BT_NIMBLE_EXT_ADV=y
+
+# BAP Unicast Server (LE Audio). Confirmed (by reading components/bt/CMakeLists.txt
+# and components/bt/esp_ble_audio/Kconfig*/*.in directly) that esp_bt_audio's
+# LE Audio sources/headers — including esp_ble_audio_defs.h/esp_ble_audio_pacs_api.h/
+# esp_ble_audio_bap_api.h that le_audio_bap.cpp includes — are ALL compiled
+# conditionally on CONFIG_BT_AUDIO && CONFIG_BT_ISO; the Phase 0 "esp_bt_audio
+# builds cleanly" result was building an empty shell without this set. Setting
+# just this one option cascades (via Kconfig `select`) to BT_ISO_PERIPHERAL ->
+# BT_ISO_UNICAST -> BT_ISO, and BT_ASCS -> BT_ASCS_ASE_SNK/SRC (default y once
+# their MAX_COUNT Kconfig ints default > 0) -> BT_PAC_SNK/SRC + BT_AUDIO_RX/TX
+# -> BT_AUDIO.
+CONFIG_BT_BAP_UNICAST_SERVER=y
+
+# esp_ble_audio/host/adapter/nimble/init.c static_asserts TOTAL_CCCDS_COUNT
+# (computed from enabled ASCS ASE sink/source counts + PACS characteristics)
+# against this. Default is 8; with BT_ASCS's default 2 sink + 2 source ASEs
+# plus PACS's 6 CCCD-bearing characteristics plus the 6 reserved for other
+# GATT services, the real requirement is 17 — bumped to 24 for headroom.
+CONFIG_BT_NIMBLE_MAX_CCCDS=24
+
+# The BT_ISO Kconfig cascade from BT_BAP_UNICAST_SERVER above only reaches
+# the *host*-side ISO code. The *controller*-side BLE 5.2 ISO feature
+# (porting_btdm/controller/ble/Kconfig.in) is a separate, independently
+# defaulted-off option — without it, esp_hci_internal.h's ISO transport
+# declarations (r_ble_hci_trans_hs_iso_tx etc., wrapped in #if
+# CONFIG_BT_LE_ISO_SUPPORT) are compiled out, causing "implicit declaration"
+# errors in NimBLE's own ble_hs_iso.c. Confirmed to exist and be selectable
+# (not another missing-implementation gap) by reading the Kconfig directly.
+CONFIG_BT_LE_ISO_SUPPORT=y

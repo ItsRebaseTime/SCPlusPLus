@@ -1,0 +1,6 @@
+dependencies:
+  espressif/usb: "*"
+  espressif/esp_codec_dev: "^1.3.4"
+  # Phase 3: BAP Unicast Server (LE Audio). Needs CONFIG_BT_NIMBLE_EXT_ADV
+  # (see sdkconfig.defaults) — confirmed via real build attempts in Phase 0.
+  espressif/esp_bt_audio: "*"

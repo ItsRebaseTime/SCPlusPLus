@@ -1,0 +1,27 @@
+{
+  "build": {
+    "core": "esp32",
+    "f_cpu": "320000000L",
+    "f_flash": "80000000L",
+    "flash_mode": "qio",
+    "mcu": "esp32s31",
+    "variant": "esp32s31"
+  },
+  "connectivity": [
+    "bluetooth",
+    "wifi"
+  ],
+  "frameworks": [
+    "espidf"
+  ],
+  "name": "ESP32-S31-Function-CoreBoard-1 (Phase 0 spike, flash/PSRAM sizes unconfirmed)",
+  "url": "https://docs.espressif.com/projects/esp-dev-kits/en/latest/esp32s31/esp32-s31-function-coreboard-1/user_guide.html",
+  "upload": {
+    "flash_size": "16MB",
+    "maximum_ram_size": 524288,
+    "maximum_size": 16777216,
+    "require_upload_port": true,
+    "speed": 460800
+  },
+  "vendor": "espressif"
+}
