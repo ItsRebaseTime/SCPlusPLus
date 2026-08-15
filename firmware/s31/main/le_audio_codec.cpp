@@ -124,7 +124,7 @@ static bool es8311_init(uint32_t sample_rate_hz) {
         .bits_per_sample = I2S_DATA_BIT_WIDTH_16BIT,
         .channel = 2,
         .channel_mask = 0x03,
-        .sample_rate = (int)sample_rate_hz,
+        .sample_rate = sample_rate_hz,
     };
     if (esp_codec_dev_open(s_codec_handle, &sample_cfg) != ESP_CODEC_DEV_OK) {
         ESP_LOGE(TAG, "esp_codec_dev_open failed");

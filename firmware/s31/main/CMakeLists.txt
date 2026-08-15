@@ -1,8 +1,17 @@
 idf_component_register(
     SRCS "main.cpp" "sc_input.cpp" "ds_edge_hid.cpp" "le_audio_codec.cpp" "le_audio_bap.c"
     INCLUDE_DIRS "."
-    REQUIRES usb esp_timer bt driver esp_driver_i2s esp_driver_i2c
+    REQUIRES usb esp_timer bt driver esp_driver_i2s esp_driver_i2c nvs_flash
 )
+
+# The newer official ESP-IDF checkout's default build flags turn on
+# -Wmissing-field-initializers as an error. This codebase, like ESP-IDF's own
+# headers/examples, relies extensively and idiomatically on partial
+# designated initializers (`{ .field = x }`, zero-initializing the rest) for
+# large config structs (i2c_master_bus_config_t, es8311_codec_cfg_t,
+# ble_gatt_dsc_def, usb_host_config_t, etc.) — not a bug to fix file-by-file,
+# just this one warning class this project doesn't want as an error.
+target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-missing-field-initializers)
 
 # ESP-IDF's NimBLE porting-layer headers (nimble_npl_os.h and friends) use
 # C-style implicit int<->enum conversions that are hard errors under strict

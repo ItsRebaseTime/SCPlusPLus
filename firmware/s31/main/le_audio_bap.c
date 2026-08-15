@@ -38,6 +38,7 @@
 #include "services/dis/ble_svc_dis.h"
 
 #include "esp_ble_audio_defs.h"
+#include "esp_ble_audio_common_api.h"
 #include "esp_ble_audio_pacs_api.h"
 #include "esp_ble_audio_bap_api.h"
 #include "esp_ble_audio_lc3_defs.h"
@@ -51,6 +52,7 @@
 
 #include "esp_log.h"
 #include "esp_err.h"
+#include "nvs_flash.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -343,18 +345,17 @@ static esp_ble_audio_bap_stream_ops_t s_stream_ops = {
 static int gap_event_handler(struct ble_gap_event *event, void *arg);
 
 static void start_advertising(void) {
+    // Real hardware bring-up (2026-08-15): flags + appearance + tx_pwr_lvl +
+    // 2 service UUIDs + the full device name together exceeded legacy
+    // advertising's 31-byte payload limit (ble_gap_adv_set_fields() failed
+    // with rc=4 / BLE_HS_EMSGSIZE — confirmed on real hardware, never
+    // caught before since this is the first time this code actually ran on
+    // a device). Split across the primary advertisement (compact identity:
+    // flags + both service UUIDs, ~9 bytes) and the scan response
+    // (appearance + tx power + name, ~23 bytes) — both comfortably under 31
+    // bytes on their own, standard NimBLE pattern for this exact problem.
     struct ble_hs_adv_fields fields = {0};
     fields.flags = BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP;
-    fields.tx_pwr_lvl_is_present = 1;
-    fields.tx_pwr_lvl = BLE_HS_ADV_TX_PWR_LVL_AUTO;
-    // Wearable Audio Device / Headset appearance — closer to the combo
-    // device's actual behavior than a plain HID gamepad value, since this
-    // one advertisement now represents both roles. Worth validating against
-    // a real host: whether one appearance value serves both profiles
-    // acceptably, or whether the two need to be distinguished some other
-    // way, is unverified.
-    fields.appearance = ESP_BLE_AUDIO_APPEARANCE_WEARABLE_AUDIO_DEVICE_HEADSET;
-    fields.appearance_is_present = 1;
 
     // Advertise both the HID-over-GATT service UUID and PACS, so host OS
     // Bluetooth stacks can recognize this as a combo HID+LE-Audio device.
@@ -366,14 +367,32 @@ static void start_advertising(void) {
     fields.num_uuids16 = 2;
     fields.uuids16_is_complete = 1;
 
-    static const char name[] = "DualSense Edge";
-    fields.name = (const uint8_t*)name;
-    fields.name_len = sizeof(name) - 1;
-    fields.name_is_complete = 1;
-
     int rc = ble_gap_adv_set_fields(&fields);
     if (rc != 0) {
         ESP_LOGE(TAG, "adv_set_fields failed rc=%d", rc);
+        return;
+    }
+
+    struct ble_hs_adv_fields rsp_fields = {0};
+    rsp_fields.tx_pwr_lvl_is_present = 1;
+    rsp_fields.tx_pwr_lvl = BLE_HS_ADV_TX_PWR_LVL_AUTO;
+    // Wearable Audio Device / Headset appearance — closer to the combo
+    // device's actual behavior than a plain HID gamepad value, since this
+    // one advertisement now represents both roles. Worth validating against
+    // a real host: whether one appearance value serves both profiles
+    // acceptably, or whether the two need to be distinguished some other
+    // way, is unverified.
+    rsp_fields.appearance = ESP_BLE_AUDIO_APPEARANCE_WEARABLE_AUDIO_DEVICE_HEADSET;
+    rsp_fields.appearance_is_present = 1;
+
+    static const char name[] = "DualSense Edge";
+    rsp_fields.name = (const uint8_t*)name;
+    rsp_fields.name_len = sizeof(name) - 1;
+    rsp_fields.name_is_complete = 1;
+
+    rc = ble_gap_adv_rsp_set_fields(&rsp_fields);
+    if (rc != 0) {
+        ESP_LOGE(TAG, "adv_rsp_set_fields failed rc=%d", rc);
         return;
     }
 
@@ -406,8 +425,86 @@ static int gap_event_handler(struct ble_gap_event *event, void *arg) {
     }
 }
 
+// Real hardware bring-up (2026-08-15): esp_ble_audio_common_init() issues an
+// HCI command internally and fails with BLE_HS_ENOTSYNCED — confirmed via
+// the exact NimBLE log line at the crash site — if called before the
+// NimBLE host has synced with the controller. That only happens once
+// nimble_port_freertos_init()'s host task is actually running and
+// processing events, i.e. strictly after le_audio_bap_begin() returns. So
+// unlike the "register all GATT services, then start the host" order this
+// file used against the older (pioarduino, April) IDF snapshot — which
+// worked fine there — esp_ble_audio's PACS/ASCS registration (and
+// everything that depends on it: the HID service sharing the same
+// ble_gatts_start() call) now has to be deferred to run from inside
+// on_sync() instead. Guarded by s_services_registered since sync_cb can
+// fire again after a host reset/resync.
+static bool s_services_registered = false;
+static void mic_encode_task(void *arg);
+
+static void register_services_and_start(void) {
+    if (s_services_registered) return;
+    s_services_registered = true;
+
+    ESP_ERROR_CHECK(esp_ble_audio_common_init(NULL));
+
+    ble_svc_dis_init();
+    ble_svc_dis_manufacturer_name_set("Sony Interactive Entertainment");
+    ble_svc_dis_model_number_set("DualSense Edge Wireless Controller");
+    {
+        uint8_t pnp[7] = {
+            0x02, 0x4C, 0x05, 0xF2, 0x0D, 0x08, 0x04,  // Sony VID 0x054C, DS Edge PID 0x0DF2, ver 0x0408
+        };
+        ble_svc_dis_pnp_id_set((const char*)pnp);
+    }
+    ble_svc_bas_init();
+
+    // PACS: bidirectional (sink = speaker, source = mic).
+    esp_ble_audio_pacs_register_param_t pacs_param = {0};
+    pacs_param.snk_pac = true;
+    pacs_param.snk_loc = true;
+    pacs_param.src_pac = true;
+    pacs_param.src_loc = true;
+    ESP_ERROR_CHECK(esp_ble_audio_pacs_register(&pacs_param));
+    ESP_ERROR_CHECK(esp_ble_audio_pacs_cap_register(ESP_BLE_AUDIO_DIR_SINK, &s_pacs_cap_snk));
+    ESP_ERROR_CHECK(esp_ble_audio_pacs_cap_register(ESP_BLE_AUDIO_DIR_SOURCE, &s_pacs_cap_src));
+    ESP_ERROR_CHECK(esp_ble_audio_pacs_set_location(ESP_BLE_AUDIO_DIR_SINK, ESP_BLE_AUDIO_LOCATION_MONO_AUDIO));
+    ESP_ERROR_CHECK(esp_ble_audio_pacs_set_location(ESP_BLE_AUDIO_DIR_SOURCE, ESP_BLE_AUDIO_LOCATION_MONO_AUDIO));
+    // Real hardware bring-up (2026-08-15): "available" contexts must be a
+    // subset of "supported" contexts — the blob's PACS validation rejected
+    // set_available_contexts() with "PacsInvSuppMask" because supported
+    // contexts defaults to empty and was never explicitly set.
+    ESP_ERROR_CHECK(esp_ble_audio_pacs_set_supported_contexts(ESP_BLE_AUDIO_DIR_SINK, ESP_BLE_AUDIO_CONTEXT_TYPE_CONVERSATIONAL));
+    ESP_ERROR_CHECK(esp_ble_audio_pacs_set_supported_contexts(ESP_BLE_AUDIO_DIR_SOURCE, ESP_BLE_AUDIO_CONTEXT_TYPE_CONVERSATIONAL));
+    ESP_ERROR_CHECK(esp_ble_audio_pacs_set_available_contexts(ESP_BLE_AUDIO_DIR_SINK, ESP_BLE_AUDIO_CONTEXT_TYPE_CONVERSATIONAL));
+    ESP_ERROR_CHECK(esp_ble_audio_pacs_set_available_contexts(ESP_BLE_AUDIO_DIR_SOURCE, ESP_BLE_AUDIO_CONTEXT_TYPE_CONVERSATIONAL));
+
+    // ASCS: 1 sink ASE + 1 source ASE.
+    esp_ble_audio_bap_unicast_server_register_param_t ascs_param = {0};
+    ascs_param.snk_cnt = 1;
+    ascs_param.src_cnt = 1;
+    ESP_ERROR_CHECK(esp_ble_audio_bap_unicast_server_register(&ascs_param));
+    ESP_ERROR_CHECK(esp_ble_audio_bap_unicast_server_register_cb(&s_server_cb));
+    ESP_ERROR_CHECK(esp_ble_audio_bap_stream_cb_register(&s_sink_stream, &s_stream_ops));
+    ESP_ERROR_CHECK(esp_ble_audio_bap_stream_cb_register(&s_source_stream, &s_stream_ops));
+
+    // HID service (ds_edge_hid.cpp) onto the same GATT server.
+    const struct ble_gatt_svc_def *hid_svcs = ds_edge_hid_get_services();
+    int rc = ble_gatts_count_cfg(hid_svcs);
+    if (rc != 0) { ESP_LOGE(TAG, "gatts_count_cfg (HID) failed rc=%d", rc); return; }
+    rc = ble_gatts_add_svcs(hid_svcs);
+    if (rc != 0) { ESP_LOGE(TAG, "gatts_add_svcs (HID) failed rc=%d", rc); return; }
+
+    ble_svc_gap_device_name_set("DualSense Edge");
+
+    rc = ble_gatts_start();
+    if (rc != 0) { ESP_LOGE(TAG, "gatts_start failed rc=%d", rc); return; }
+
+    xTaskCreate(mic_encode_task, "mic_enc", 4096, NULL, 5, &s_mic_task_handle);
+}
+
 static void on_sync(void) {
     ble_hs_id_infer_auto(0, &s_own_addr_type);
+    register_services_and_start();
     start_advertising();
 }
 
@@ -476,6 +573,22 @@ static void mic_encode_task(void *arg) {
 // Public API
 // ---------------------------------------------------------------------
 void le_audio_bap_begin(void) {
+    // Real hardware bring-up (2026-08-15): the PHY calibration data the BT
+    // controller loads on init lives in NVS. Without initializing it first,
+    // esp_phy_load_cal_data_from_nvs() logs a warning and falls back to full
+    // calibration, but the *following* step then hits an unguarded null
+    // dereference (Guru Meditation / Load access fault) inside phy_init —
+    // this crash is what "Real hardware bring-up" in BUILD.md previously
+    // reported, before the actual cause was traced here. Standard ESP-IDF
+    // boilerplate (nvs_flash_init(), with the erase-and-retry fallback for a
+    // truncated/incompatible partition) fixes it.
+    esp_err_t nvs_err = nvs_flash_init();
+    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        nvs_err = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(nvs_err);
+
     // BT controller must be up before esp_nimble_init()-based bring-up
     // (matches the pattern in espressif/esp_bt_audio's own reference
     // example, which calls this itself before esp_bt_audio_init()).
@@ -500,53 +613,11 @@ void le_audio_bap_begin(void) {
     ble_svc_gap_init();
     ble_svc_gatt_init();
 
-    ble_svc_dis_init();
-    ble_svc_dis_manufacturer_name_set("Sony Interactive Entertainment");
-    ble_svc_dis_model_number_set("DualSense Edge Wireless Controller");
-    {
-        uint8_t pnp[7] = {
-            0x02, 0x4C, 0x05, 0xF2, 0x0D, 0x08, 0x04,  // Sony VID 0x054C, DS Edge PID 0x0DF2, ver 0x0408
-        };
-        ble_svc_dis_pnp_id_set((const char*)pnp);
-    }
-    ble_svc_bas_init();
-
-    // PACS: bidirectional (sink = speaker, source = mic).
-    esp_ble_audio_pacs_register_param_t pacs_param = {0};
-    pacs_param.snk_pac = true;
-    pacs_param.snk_loc = true;
-    pacs_param.src_pac = true;
-    pacs_param.src_loc = true;
-    ESP_ERROR_CHECK(esp_ble_audio_pacs_register(&pacs_param));
-    ESP_ERROR_CHECK(esp_ble_audio_pacs_cap_register(ESP_BLE_AUDIO_DIR_SINK, &s_pacs_cap_snk));
-    ESP_ERROR_CHECK(esp_ble_audio_pacs_cap_register(ESP_BLE_AUDIO_DIR_SOURCE, &s_pacs_cap_src));
-    ESP_ERROR_CHECK(esp_ble_audio_pacs_set_location(ESP_BLE_AUDIO_DIR_SINK, ESP_BLE_AUDIO_LOCATION_MONO_AUDIO));
-    ESP_ERROR_CHECK(esp_ble_audio_pacs_set_location(ESP_BLE_AUDIO_DIR_SOURCE, ESP_BLE_AUDIO_LOCATION_MONO_AUDIO));
-    ESP_ERROR_CHECK(esp_ble_audio_pacs_set_available_contexts(ESP_BLE_AUDIO_DIR_SINK, ESP_BLE_AUDIO_CONTEXT_TYPE_CONVERSATIONAL));
-    ESP_ERROR_CHECK(esp_ble_audio_pacs_set_available_contexts(ESP_BLE_AUDIO_DIR_SOURCE, ESP_BLE_AUDIO_CONTEXT_TYPE_CONVERSATIONAL));
-
-    // ASCS: 1 sink ASE + 1 source ASE.
-    esp_ble_audio_bap_unicast_server_register_param_t ascs_param = {0};
-    ascs_param.snk_cnt = 1;
-    ascs_param.src_cnt = 1;
-    ESP_ERROR_CHECK(esp_ble_audio_bap_unicast_server_register(&ascs_param));
-    ESP_ERROR_CHECK(esp_ble_audio_bap_unicast_server_register_cb(&s_server_cb));
-    ESP_ERROR_CHECK(esp_ble_audio_bap_stream_cb_register(&s_sink_stream, &s_stream_ops));
-    ESP_ERROR_CHECK(esp_ble_audio_bap_stream_cb_register(&s_source_stream, &s_stream_ops));
-
-    // HID service (ds_edge_hid.cpp) onto the same GATT server.
-    const struct ble_gatt_svc_def *hid_svcs = ds_edge_hid_get_services();
-    int rc = ble_gatts_count_cfg(hid_svcs);
-    if (rc != 0) { ESP_LOGE(TAG, "gatts_count_cfg (HID) failed rc=%d", rc); return; }
-    rc = ble_gatts_add_svcs(hid_svcs);
-    if (rc != 0) { ESP_LOGE(TAG, "gatts_add_svcs (HID) failed rc=%d", rc); return; }
-
-    ble_svc_gap_device_name_set("DualSense Edge");
-
-    rc = ble_gatts_start();
-    if (rc != 0) { ESP_LOGE(TAG, "gatts_start failed rc=%d", rc); return; }
-
-    xTaskCreate(mic_encode_task, "mic_enc", 4096, NULL, 5, &s_mic_task_handle);
-
+    // Real hardware bring-up (2026-08-15): esp_ble_audio_common_init() and
+    // everything downstream of it (PACS/ASCS/HID registration,
+    // ble_gatts_start()) is deferred to register_services_and_start(),
+    // called from on_sync() — see that function's comment for why (needs
+    // the NimBLE host actually synced with the controller, which only
+    // happens once the host task below is running).
     nimble_port_freertos_init(nimble_host_task);
 }

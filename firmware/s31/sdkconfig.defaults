@@ -5,11 +5,56 @@
 # the Steam Controller uses, so no console-routing workaround is needed here.
 CONFIG_USB_OTG_SUPPORTED=y
 
+# esp_ble_iso (pulled in transitively for LE Audio/ISO on the newer official
+# ESP-IDF checkout) emits "#warning FreeRTOS with 1ms tick rate is strongly
+# recommended for running ISO" at the default 100Hz/10ms tick, which this
+# build's -Werror config turns fatal. Following the recommendation directly
+# is also just correct for CIS/ISO timing precision, not merely a warning
+# suppression.
+CONFIG_FREERTOS_HZ=1000
+
+# Real hardware bring-up (2026-08-15): the actual flash chip on this board is
+# 16MB (confirmed via `esptool flash_id` -> device 0x4018, and the boot log's
+# own "Detected size(16384k)" notice), but this was left at IDF's 2MB
+# default — a real bug independent of the boot hang documented in BUILD.md's
+# "Real hardware bring-up" section (fixing this did NOT resolve that hang,
+# but a 2MB/16MB flash-size mismatch is wrong regardless and worth keeping
+# fixed).
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="16MB"
+
+# Dropped from the 80MHz default after the boot-hang investigation (see
+# BUILD.md) traced the hang to inside esp_flash's app-level init, right
+# after it falls back to a "generic" (unrecognized) flash-chip driver — on
+# the theory that 80MHz DIO might exceed this specific, unrecognized chip's
+# real signal margin. This did NOT fix the hang either, but 40MHz is a
+# strictly safer choice for an unrecognized flash chip on unverified new
+# hardware regardless, so left in place.
+CONFIG_ESPTOOLPY_FLASHFREQ_40M=y
+
+# Real hardware bring-up (2026-08-15): enabling CONFIG_BT_NIMBLE_ROLE_CENTRAL
+# (see below) pulled in enough extra GATT-client code that the app overflowed
+# the default 1MB single-app partition by ~88KB. The board's real flash is
+# 16MB (see above), so there's no reason to stay on the small partition
+# table — switch to IDF's built-in "large" single-app table (2MB) instead of
+# hand-rolling a custom partitions.csv.
+CONFIG_PARTITION_TABLE_SINGLE_APP_LARGE=y
+
 CONFIG_BT_ENABLED=y
 CONFIG_BT_NIMBLE_ENABLED=y
 CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
-CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
 CONFIG_BT_NIMBLE_ROLE_BROADCASTER=n
+
+# Real hardware bring-up (2026-08-15): esp_ble_audio_common_init() (see the
+# comment at its call site in le_audio_bap.c) pulls in NimBLE GATT-client
+# code (esp_ble_iso/host/adapter/nimble/gatt/gatt.nrp.c calls
+# ble_gattc_read/_by_uuid/_long, ble_gattc_write_flat/_no_rsp_flat) —
+# confirmed via real "undefined reference" link errors with Central off.
+# This app never actually scans or initiates connections (still peripheral-
+# only in practice), but the GATT client *functions* need to be compiled
+# into NimBLE's own host library for esp_ble_audio's internal cross-service
+# discovery to link, which apparently needs Central role enabled to pull in.
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=y
 
 # Observer role: this device never scans/connects as a GAP central, but the
 # CIS/BIG ISO HCI event handler bodies (ble_hs_hci_evt_le_cis_estab et al —
